@@ -131,7 +131,11 @@ struct demod_state
 	int      downsample;    /* min 1, max 256 */
 	int      post_downsample;
 	int      output_scale;
-	int      squelch_level, conseq_squelch, squelch_hits, terminate_on_squelch;
+	int      squelch_level;
+	int      squelch_conseq;
+	int      squelch_hits;
+	int      squelch_signal_rms;
+	int      terminate_on_squelch;
 	int      downsample_passes;
 	int      comp_fir_size;
 	int      custom_atan;
@@ -730,7 +734,6 @@ void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 void full_demod(struct demod_state *d)
 {
 	int i, ds_p;
-	int sr = 0;
 	ds_p = d->downsample_passes;
 	if (ds_p) {
 		for (i=0; i < ds_p; i++) {
@@ -748,17 +751,20 @@ void full_demod(struct demod_state *d)
 	} else {
 		low_pass(d);
 	}
+
 	/* power squelch */
 	if (d->squelch_level) {
-		sr = rms(d->lowpassed, d->lp_len, 1);
-		if (sr < d->squelch_level) {
+		d->squelch_signal_rms = rms(d->lowpassed, d->lp_len, 1);
+		if (d->squelch_signal_rms < d->squelch_level) {
 			d->squelch_hits++;
-			for (i=0; i<d->lp_len; i++) {
+			for (i = 0; i < d->lp_len; i++) {
 				d->lowpassed[i] = 0;
 			}
 		} else {
-			d->squelch_hits = 0;}
+			d->squelch_hits = 0;
+		}
 	}
+
 	d->mode_demod(d);  /* lowpassed -> result */
 	if (d->mode_demod == &raw_demod) {
 		return;
@@ -814,6 +820,7 @@ static void *demod_thread_fn(void *arg)
 {
 	struct demod_state *d = arg;
 	struct output_state *o = d->output_target;
+
 	while (!do_exit) {
 		safe_cond_wait(&d->ready, &d->ready_m);
 		pthread_rwlock_wrlock(&d->rw);
@@ -822,17 +829,20 @@ static void *demod_thread_fn(void *arg)
 		if (d->exit_flag) {
 			do_exit = 1;
 		}
-		if (d->squelch_level && d->squelch_hits > d->conseq_squelch) {
-			d->squelch_hits = d->conseq_squelch + 1;  /* hair trigger */
+
+		if (d->squelch_level && d->squelch_hits > d->squelch_conseq) {
+			d->squelch_hits = d->squelch_conseq + 1;  /* hair trigger */
 			safe_cond_signal(&controller.hop, &controller.hop_m);
 			continue;
 		}
+
 		pthread_rwlock_wrlock(&o->rw);
 		memcpy(o->result, d->result, 2*d->result_len);
 		o->result_len = d->result_len;
 		pthread_rwlock_unlock(&o->rw);
 		safe_cond_signal(&o->ready, &o->ready_m);
 	}
+
 	return 0;
 }
 
@@ -909,9 +919,14 @@ static void *controller_thread_fn(void *arg)
 	while (!do_exit) {
 		safe_cond_wait(&s->hop, &s->hop_m);
 		if (s->freq_len <= 1) {
-			continue;}
+			continue;
+		}
+
 		/* hacky hopping */
 		s->freq_now = (s->freq_now + 1) % s->freq_len;
+		fprintf(stderr, "Frequency: %.3f MHz (signal: %d, squelch: %d)\r",
+			s->freqs[s->freq_now] / 1e6, demod.squelch_signal_rms,
+			demod.squelch_level);
 		optimal_settings(s->freqs[s->freq_now], demod.rate_in);
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
 		dongle.mute = BUFFER_DUMP;
@@ -954,7 +969,7 @@ void demod_init(struct demod_state *s)
 	s->rate_in = DEFAULT_SAMPLE_RATE;
 	s->rate_out = DEFAULT_SAMPLE_RATE;
 	s->squelch_level = 0;
-	s->conseq_squelch = 10;
+	s->squelch_conseq = 10;
 	s->terminate_on_squelch = 0;
 	s->squelch_hits = 11;
 	s->downsample_passes = 0;
@@ -1027,7 +1042,7 @@ void sanity_checks(void)
 		exit(1);
 	}
 
-	if (controller.freq_len > 1 && demod.squelch_level == 0) {
+	if (controller.freq_len > 1 && !demod.squelch_level) {
 		fprintf(stderr, "Please specify a squelch level.  Required for scanning multiple frequencies.\n");
 		exit(1);
 	}
@@ -1085,9 +1100,9 @@ int main(int argc, char **argv)
 				fprintf(stderr, "Oversample must be between 1 and %i\n", MAXIMUM_OVERSAMPLE);}
 			break;
 		case 't':
-			demod.conseq_squelch = (int)atof(optarg);
-			if (demod.conseq_squelch < 0) {
-				demod.conseq_squelch = -demod.conseq_squelch;
+			demod.squelch_conseq = (int)atof(optarg);
+			if (demod.squelch_conseq < 0) {
+				demod.squelch_conseq = -demod.squelch_conseq;
 				demod.terminate_on_squelch = 1;
 			}
 			break;
