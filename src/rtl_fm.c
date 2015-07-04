@@ -84,6 +84,8 @@
 
 #define FREQUENCIES_LIMIT		1000
 
+#define SQUELCH_TIMEOUT			100
+
 static volatile int do_exit = 0;
 static int lcm_post[17] = {1,1,1,3,1,5,3,7,1,9,5,11,3,13,7,15,1};
 static int ACTUAL_BUF_LENGTH;
@@ -135,6 +137,7 @@ struct demod_state
 	int      squelch_conseq;
 	int      squelch_hits;
 	int      squelch_signal_rms;
+	int      squelch_timer;
 	int      terminate_on_squelch;
 	int      downsample_passes;
 	int      comp_fir_size;
@@ -762,6 +765,7 @@ void full_demod(struct demod_state *d)
 			}
 		} else {
 			d->squelch_hits = 0;
+			d->squelch_timer++;
 		}
 	}
 
@@ -830,10 +834,18 @@ static void *demod_thread_fn(void *arg)
 			do_exit = 1;
 		}
 
-		if (d->squelch_level && d->squelch_hits > d->squelch_conseq) {
-			d->squelch_hits = d->squelch_conseq + 1;  /* hair trigger */
-			safe_cond_signal(&controller.hop, &controller.hop_m);
-			continue;
+		if (d->squelch_level) {
+			if (d->squelch_hits > d->squelch_conseq) {
+				d->squelch_hits = d->squelch_conseq + 1;  /* hair trigger */
+				safe_cond_signal(&controller.hop, &controller.hop_m);
+				continue;
+			}
+
+			if (d->squelch_timer >= SQUELCH_TIMEOUT) {
+				d->squelch_timer = 0;
+				safe_cond_signal(&controller.hop, &controller.hop_m);
+				continue;
+			}
 		}
 
 		pthread_rwlock_wrlock(&o->rw);
@@ -972,6 +984,7 @@ void demod_init(struct demod_state *s)
 	s->squelch_conseq = 10;
 	s->terminate_on_squelch = 0;
 	s->squelch_hits = 11;
+	s->squelch_timer = 0;
 	s->downsample_passes = 0;
 	s->comp_fir_size = 0;
 	s->prev_index = 0;
